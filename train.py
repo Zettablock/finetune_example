@@ -1,14 +1,13 @@
-import os
-
 import torch
-import torch.nn as nn
 import transformers
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import TrainingArguments
 from dataclasses import dataclass, field
-from peft import LoraConfig, get_peft_model
-from unsloth import FastLanguageModel
-import prompts
+from unsloth import FastLanguageModel, is_bfloat16_supported
+from utils import format_prompt
+from trl import SFTTrainer
+# import evaluate
+
 
 load_in_4bit = True
 
@@ -23,27 +22,26 @@ class ModelArguments():
 @dataclass
 class DataArguments():
     data_id: str = field(
-        default = "SetFit/enron_spam",
+        default = "ruslanmv/ai-medical-chatbot",
         metadata={'help': 'HF dataset id'}
     )
 
-@dataclass
-class TrainingArguments():
-    optimizer: str = field(default="adamw-torch")
-    output_dir: str = field(default = "out/llama3/")
-    max_seq_length: int = field(default=512, metadata={"help": "Maximum input sequence length. Sequences will be right padded and possibly truncated."})
-
-
 # Train using unsloth
 def train():
+    # parser = transformers.HfArgumentParser(
+    #     (ModelArguments, DataArguments, TrainingArguments)
+    # )
+
+    # model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
     parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments)
+        (ModelArguments, DataArguments)
     )
 
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    model_args, data_args = parser.parse_args_into_dataclasses()
 
-    model_id = model_args.model_name_or_oath
-    max_seq_length = training_args.max_seq_length
+    model_id = model_args.model_id
+    max_seq_length = 512
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_id,
@@ -73,62 +71,92 @@ def train():
         lora_alpha=config["lora_alpha"],
         lora_dropout=config["lora_dropout"],
         bias=config["bias"],
-        use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
+        use_gradient_checkpointing = "unsloth", 
         random_state = 3407,
-        use_rslora = False,  # We support rank stabilized LoRA
-        loftq_config = None, # And LoftQ
+        use_rslora = False,  
+        loftq_config = None, 
     )
 
     EOS_TOKEN = tokenizer.eos_token
     print(f"EOS_TOKEN: {EOS_TOKEN}")
 
+    dataset = load_dataset(data_args.data_id, split='train').select(range(20000))
+    split_dataset = dataset.train_test_split(test_size=0.2, seed=42)
+    train_dataset = split_dataset['train']
+    test_dataset = split_dataset['test']
+
+    train_dataset = train_dataset.map(lambda examples: format_prompt(examples, EOS_TOKEN=EOS_TOKEN), batched = True,)
+    test_dataset = test_dataset.map(lambda examples: format_prompt(examples, EOS_TOKEN=EOS_TOKEN), batched = True,)
+
+    print(train_dataset)
+
+    # # Evaluate before fine-tuning
+    # initial_metrics = evaluate_model(model, test_dataset, tokenizer, max_seq_length)
+    # print("Initial metrics:", initial_metrics)
 
 
+    trainer = SFTTrainer(
+        model = model,
+        tokenizer = tokenizer,
+        train_dataset = train_dataset,
+        dataset_text_field = "text",
+        max_seq_length = max_seq_length,
+        dataset_num_proc = 2,
+        args = TrainingArguments(
+            per_device_train_batch_size = 2,
+            gradient_accumulation_steps = 4,
+            
+            # Use num_train_epochs = 1, warmup_ratio for full training runs!
+            warmup_steps = 5,
+            max_steps = 60,
 
-
-
-
-
-def train_no_unsloth():
-    parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments)
+            learning_rate = 2e-4,
+            fp16 = not is_bfloat16_supported(),
+            bf16 = is_bfloat16_supported(),
+            logging_steps = 1,
+            optim = "adamw_8bit",
+            weight_decay = 0.01,
+            lr_scheduler_type = "linear",
+            seed = 3407,
+            output_dir = "health-model",
+            push_to_hub=True
+        ),
     )
 
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    #@title Show current memory stats
+    gpu_stats = torch.cuda.get_device_properties(0)
+    start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+    max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
+    print(f"GPU = {gpu_stats.name}. Max memory = {max_memory} GB.")
+    print(f"{start_gpu_memory} GB of memory reserved.")
 
-    model_id = model_args.model_name_or_oath
+    trainer_stats = trainer.train()
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id,
-        # cache_dir = training_args.cache_dir,
-        # model_max_length = training_args.model_max_length,
-        # padding_side="right",
-        # use_fast=False,
-    )
+    used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+    used_memory_for_lora = round(used_memory - start_gpu_memory, 3)
+    used_percentage = round(used_memory         /max_memory*100, 3)
+    lora_percentage = round(used_memory_for_lora/max_memory*100, 3)
+    print(f"{trainer_stats.metrics['train_runtime']} seconds used for training.")
+    print(f"{round(trainer_stats.metrics['train_runtime']/60, 2)} minutes used for training.")
+    print(f"Peak reserved memory = {used_memory} GB.")
+    print(f"Peak reserved memory for training = {used_memory_for_lora} GB.")
+    print(f"Peak reserved memory % of max memory = {used_percentage} %.")
+    print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        device_map='auto'
-    )
+    # Evaluate before fine-tuning
+    # final_metrics = evaluate_model(model, test_dataset, tokenizer, max_seq_length)
+    # print("Final metrics:", final_metrics)
 
-    config = {
-        "lr": 5e-5,
-        "epochs": 2,
-        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",],
-        "lora_alpha": 64,
-        "r": 16,
-        "lora_alpha": 16,
-        "batch_size": 16,
-    }   
 
-    lora_config = LoraConfig(
-        task_type="CAUSAL_LM",
-        r=config["r"],
-        lora_alpha=config["lora_alpha"],
-        target_modules=config["target_modules"],
-        lora_dropout=0.01,
-    )
+    trainer.push_to_hub()
+
+    # Merge to 16bit
+    model.save_pretrained_merged("health-model", tokenizer, save_method = "merged_16bit",)
+    # model.push_to_hub_merged("hf/model", tokenizer, save_method = "merged_16bit", token = "")
+    
+
+
+
 
 def main():
     train()
@@ -141,206 +169,3 @@ if __name__=="__main__":
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-# -*- coding: utf-8 -*-
-"""Finetune-opt-bnb-peft.ipynb
-
-Automatically generated by Colaboratory.
-
-Original file is located at
-    https://colab.research.google.com/drive/1jCkpikz0J2o20FBQmYmAGdiKmJGOMo-o
-
-## Fine-tune large models using 🤗 `peft` adapters, `transformers` & `bitsandbytes`
-
-In this tutorial we will cover how we can fine-tune large language models using the very recent `peft` library and `bitsandbytes` for loading large models in 8-bit.
-The fine-tuning method will rely on a recent method called "Low Rank Adapters" (LoRA), instead of fine-tuning the entire model you just have to fine-tune these adapters and load them properly inside the model.
-After fine-tuning the model you can also share your adapters on the 🤗 Hub and load them very easily. Let's get started!
-
-### Install requirements
-
-First, run the cells below to install the requirements:
-"""
-
-
-"""### Model loading
-
-Here let's load the `opt-6.7b` model, its weights in half-precision (float16) are about 13GB on the Hub! If we load them in 8-bit we would require around 7GB of memory instead.
-"""
-
-
-free_in_GB = int(torch.cuda.mem_get_info()[0] / 1024**3)
-max_memory = f"{free_in_GB-2}GB"
-
-n_gpus = torch.cuda.device_count()
-max_memory = {i: max_memory for i in range(n_gpus)}
-
-print(f"Number of gpus available: {n_gpus}")
-for key, val in max_memory.items():
-    print(f"Memory in gpu {key}: {val}")
-
-
-# Define tokenizer and model
-model_id = "meta-llama/Meta-Llama-3-8B"
-
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    max_memory=max_memory,
-    # quantization_config=BitsAndBytesConfig(
-    #     load_in_4bit=True,
-    #     llm_int8_threshold=6.0,
-    #     llm_int8_has_fp16_weight=False,
-    #     bnb_4bit_compute_dtype=torch.float16,
-    #     bnb_4bit_use_double_quant=True,
-    #     bnb_4bit_quant_type="nf4",
-    # ),
-    torch_dtype=torch.float16,
-    device_map='auto'
-)
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-"""### Post-processing on the model
-
-Finally, we need to apply some post-processing on the 8-bit model to enable training, let's freeze all our layers, and cast the layer-norm in `float32` for stability. We also cast the output of the last layer in `float32` for the same reasons.
-"""
-
-print(model)
-
-for param in model.parameters():
-    param.requires_grad = False  # freeze the model - train adapters later
-    if param.ndim == 1:
-        # cast the small parameters (e.g. layernorm) to fp32 for stability
-        param.data = param.data.to(torch.float32)
-
-# model.gradient_checkpointing_enable()  # reduce number of stored activations
-# model.model.decoder.project_in = lambda x: x.requires_grad_(True)
-
-
-class CastOutputToFloat(nn.Sequential):
-    def forward(self, x):
-        return super().forward(x).to(torch.float32)
-
-
-model.lm_head = CastOutputToFloat(model.lm_head)
-
-"""### Apply LoRA
-
-Here comes the magic with `peft`! Let's load a `PeftModel` and specify that we are going to use low-rank adapters (LoRA) using `get_peft_model` utility function from `peft`.
-"""
-
-
-def print_trainable_parameters(model):
-    """
-    Prints the number of trainable parameters in the model.
-    """
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    print(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
-    )
-
-
-config = LoraConfig(
-    r=64,
-    lora_alpha=32,
-    target_modules=["q_proj", "v_proj", "out_proj", "fc1", "fc2"],
-    lora_dropout=0.01,
-    bias="none",
-    task_type="CAUSAL_LM",
-)
-
-model = get_peft_model(model, config)
-print_trainable_parameters(model)
-
-# Verifying the datatypes.
-dtypes = {}
-for _, p in model.named_parameters():
-    dtype = p.dtype
-    if dtype not in dtypes:
-        dtypes[dtype] = 0
-    dtypes[dtype] += p.numel()
-total = 0
-for k, v in dtypes.items():
-    total += v
-for k, v in dtypes.items():
-    print(k, v, v / total)
-
-"""### Training"""
-
-data = load_dataset("Abirate/english_quotes")
-data = data.map(lambda samples: tokenizer(samples["quote"]), batched=True)
-
-trainer = transformers.Trainer(
-    model=model,
-    train_dataset=data["train"],
-    args=transformers.TrainingArguments(
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
-        warmup_steps=10,
-        max_steps=20,
-        learning_rate=3e-4,
-        fp16=True,
-        logging_steps=1,
-        output_dir="outputs",
-    ),
-    data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
-)
-model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
-trainer.train()
-
-# from huggingface_hub import notebook_login
-
-# notebook_login()
-
-# model.push_to_hub("ybelkada/opt-6.7b-lora", use_auth_token=True)
-
-"""## Load adapters from the Hub
-
-You can also directly load adapters from the Hub using the commands below:
-"""
-
-# import torch
-# from peft import PeftModel, PeftConfig
-# from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-#
-# peft_model_id = "ybelkada/opt-6.7b-lora"
-# config = PeftConfig.from_pretrained(peft_model_id)
-# model = AutoModelForCausalLM.from_pretrained(config.base_model_name_or_path, return_dict=True, quantization_config=BitsAndBytesConfig(load_in_8bit=True), device_map='auto')
-# tokenizer = AutoTokenizer.from_pretrained(config.base_model_name_or_path)
-#
-## Load the Lora model
-# model = PeftModel.from_pretrained(model, peft_model_id)
-#
-# """## Inference
-#
-# You can then directly use the trained model or the model that you have loaded from the 🤗 Hub for inference as you would do it usually in `transformers`.
-# """
-#
-batch = tokenizer("Two things are infinite: ", return_tensors="pt")
-
-model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
-model.eval()
-with torch.cuda.amp.autocast():
-    output_tokens = model.generate(**batch, max_new_tokens=50)
-
-print("\n\n", tokenizer.decode(output_tokens[0], skip_special_tokens=True))
-# model.save('./test.pt')
-
-# """As you can see by fine-tuning for few steps we have almost recovered the quote from Albert Einstein that is present in the [training data](https://huggingface.co/datasets/Abirate/english_quotes)."""

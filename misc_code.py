@@ -41,7 +41,7 @@ def train_no_unsloth():
 
 
 
-    
+
 
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -234,3 +234,17 @@ print("\n\n", tokenizer.decode(output_tokens[0], skip_special_tokens=True))
 # model.save('./test.pt')
 
 # """As you can see by fine-tuning for few steps we have almost recovered the quote from Albert Einstein that is present in the [training data](https://huggingface.co/datasets/Abirate/english_quotes)."""
+
+
+def evaluate_model(model, test_dataset, tokenizer, max_seq_length):
+    bleu = evaluate.load("bleu")
+    model.eval()
+    
+    for example in test_dataset:
+        inputs = tokenizer(example["text"], return_tensors="pt", max_length=max_seq_length, truncation=True, padding="max_length")
+        labels = inputs["input_ids"].clone()
+        outputs = model(**inputs)
+        predictions = outputs.logits.argmax(dim=-1)
+        bleu.add_batch(predictions=predictions, references=labels)
+        
+    return bleu.compute()
