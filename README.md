@@ -1,3 +1,5 @@
+This example finetunes a model using Hugging Face's `trl` framework. 
+
 # Important files:
 * `train.py`
 * `utils.py`
